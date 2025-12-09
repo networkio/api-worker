@@ -497,7 +497,8 @@ function handleCorsPreflight() {
 
 // --- [第五部分: 开发者驾驶舱 UI] ---
 function handleUI(request) {
-  const origin = new URL(request.url).origin;
+  let origin = new URL(request.url).origin;
+  if (origin.startsWith("http://")) origin = origin.replace("http://", "https://");
   const apiKey = request.ctx.apiKey;
   
   const html = `<!DOCTYPE html>
