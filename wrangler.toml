@@ -3,4 +3,3 @@ main = "worker.js"
 compatibility_date = "2024-12-09"
 
 [vars]
-API_MASTER_KEY = "N1gh7f@ll99!"
