@@ -14,10 +14,25 @@
  * =================================================================================
  */
 
+import { getCache, setCache } from "./src/cache/memoryCache.js";
+import { getKV, setKV } from "./src/cache/kvCache.js";
+import { rateLimit } from "./src/utils/rateLimit.js";
+import { jsonResponse } from "./src/utils/response.js";
+import { fetchStock } from "./src/api/fetchStock.js";
+import { fetchCrypto } from "./src/api/fetchCrypto.js";
+import { fetchForex } from "./src/api/fetchForex.js";
+import { matchRoute } from "./src/router.js";
+
 // --- [第一部分: 核心配置 (Configuration-as-Code)] ---
 const CONFIG = {
   PROJECT_NAME: "stockai-2api",
   PROJECT_VERSION: "1.0.0",
+  RATE_LIMIT: {
+    global: { limit: 60, windowSec: 60 },
+    chat: { limit: 30, windowSec: 60 },
+    data: { limit: 60, windowSec: 60 }
+  },
+  CACHE: { HOT_TTL_MS: 60_000, WARM_TTL_SEC: 600 },
   
   // 安全配置 (建议在 Cloudflare 环境变量中设置 API_MASTER_KEY)
   API_MASTER_KEY: "1", 
@@ -62,27 +77,45 @@ const CONFIG = {
 // --- [第二部分: Worker 入口与路由] ---
 export default {
   async fetch(request, env, ctx) {
+    // 1. CORS 预检
+    if (request.method === 'OPTIONS') return handleCorsPreflight();
+
     const apiKey = env.API_MASTER_KEY || CONFIG.API_MASTER_KEY;
     request.ctx = { apiKey };
 
     const url = new URL(request.url);
-
-    // 1. CORS 预检
-    if (request.method === 'OPTIONS') return handleCorsPreflight();
+    const ip = request.headers.get("CF-Connecting-IP");
 
     // 2. 路由分发
-    if (url.pathname === '/') return handleUI(request);
-    if (url.pathname.startsWith('/v1/')) return handleApi(request);
-    
+    const route = matchRoute(url);
+    if (route === "ui") return handleUI(request, env);
+    if (route === "health") return jsonResponse({ status: "ok" });
+
+    // 3. 限流保护（按路由维度）
+    const scope = route === "openai" ? "chat" : route === "data" ? "data" : "global";
+    const cfg = CONFIG.RATE_LIMIT[scope] || CONFIG.RATE_LIMIT.global;
+    const rl = await rateLimit(env, ip, cfg.limit, cfg.windowSec, scope);
+    if (!rl.allowed) return rl.response;
+
+    if (route === "openai") return handleApi(request);
+    if (route === "data") return handleDataApi(request, env);
+
     return createErrorResponse(`路径未找到: ${url.pathname}`, 404, 'not_found');
   }
 };
 
 // --- [第三部分: API 代理逻辑] ---
 
+function logEvent({ requestId, path, status = 200, durationMs = 0, note = "" }) {
+  const entry = { ts: Date.now(), requestId, path, status, durationMs, note };
+  console.log(JSON.stringify(entry));
+}
+
 async function handleApi(request) {
+  const started = Date.now();
   // 鉴权
   if (!verifyAuth(request)) {
+    logEvent({ requestId: "unauth", path: request.url, status: 401, durationMs: Date.now() - started, note: "auth_fail" });
     return createErrorResponse('Unauthorized', 401, 'auth_error');
   }
 
@@ -90,14 +123,20 @@ async function handleApi(request) {
   const requestId = `req-${crypto.randomUUID()}`;
 
   if (url.pathname === '/v1/models') {
-    return handleModelsRequest();
+    const res = handleModelsRequest();
+    logEvent({ requestId, path: url.pathname, status: res.status, durationMs: Date.now() - started });
+    return res;
   }
 
   if (url.pathname === '/v1/chat/completions') {
-    return handleChatCompletions(request, requestId);
+    const res = await handleChatCompletions(request, requestId);
+    logEvent({ requestId, path: url.pathname, status: res.status, durationMs: Date.now() - started });
+    return res;
   }
 
-  return createErrorResponse('Not Found', 404, 'not_found');
+  const res = createErrorResponse('Not Found', 404, 'not_found');
+  logEvent({ requestId, path: url.pathname, status: res.status, durationMs: Date.now() - started, note: "openai_not_found" });
+  return res;
 }
 
 // 处理模型列表
@@ -122,6 +161,7 @@ async function handleChatCompletions(request, requestId) {
     const body = await request.json();
     const model = body.model || CONFIG.DEFAULT_MODEL;
     const messages = body.messages || [];
+    const promptTokens = estimateTokensFromMessages(messages);
     const stream = body.stream !== false; // 默认为 true，除非显式设为 false
     const isWebUI = body.is_web_ui === true;
 
@@ -162,7 +202,7 @@ async function handleChatCompletions(request, requestId) {
     if (stream) {
       return handleStreamResponse(response, model, requestId, isWebUI);
     } else {
-      return handleNonStreamResponse(response, model, requestId);
+      return handleNonStreamResponse(response, model, requestId, promptTokens);
     }
 
   } catch (e) {
@@ -250,7 +290,7 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI) {
 
 // 处理非流式响应 (SSE -> JSON)
 // 适配沉浸式翻译等不支持流的插件
-async function handleNonStreamResponse(upstreamResponse, model, requestId) {
+async function handleNonStreamResponse(upstreamResponse, model, requestId, promptTokens = 0) {
   const reader = upstreamResponse.body.getReader();
   const decoder = new TextDecoder();
   let fullText = "";
@@ -282,6 +322,7 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
     throw new Error(`Stream buffering failed: ${e.message}`);
   }
 
+  const completionTokens = estimateTokens(fullText);
   const response = {
     id: requestId,
     object: "chat.completion",
@@ -292,12 +333,104 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
       message: { role: "assistant", content: fullText },
       finish_reason: "stop"
     }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens
+    }
   };
 
   return new Response(JSON.stringify(response), {
     headers: corsHeaders({ 'Content-Type': 'application/json' })
   });
+}
+
+// --- [第四部分: 数据 API 路由 (缓存 + 聚合)] ---
+async function handleDataApi(request, env) {
+  const started = Date.now();
+  if (!verifyAuth(request)) {
+    logEvent({ requestId: "unauth", path: request.url, status: 401, durationMs: Date.now() - started, note: "auth_fail" });
+    return createErrorResponse('Unauthorized', 401, 'auth_error');
+  }
+
+  const url = new URL(request.url);
+  const params = url.searchParams;
+  const hotTtl = CONFIG.CACHE.HOT_TTL_MS;
+  const warmTtl = CONFIG.CACHE.WARM_TTL_SEC;
+
+  const cached = (cacheKey, fetcher) => withCache(env, cacheKey, fetcher, hotTtl, warmTtl);
+
+  try {
+    if (url.pathname === "/api/stock") {
+      const symbol = params.get("symbol");
+      if (!symbol) return createErrorResponse('Missing symbol', 400, 'bad_request');
+      const { data, source } = await cached(`stock:${symbol.toUpperCase()}`, () => fetchStock(symbol, env));
+      return jsonResponse({ source, data });
+    }
+
+    if (url.pathname === "/api/crypto") {
+      const symbol = params.get("symbol");
+      if (!symbol) return createErrorResponse('Missing crypto symbol', 400, 'bad_request');
+      const { data, source } = await cached(`crypto:${symbol.toUpperCase()}`, () => fetchCrypto(symbol));
+      return jsonResponse({ source, data });
+    }
+
+    if (url.pathname === "/api/forex") {
+      const pair = params.get("pair");
+      if (!pair) return createErrorResponse('Missing forex pair', 400, 'bad_request');
+      const normalized = pair.toUpperCase().replace("/", "");
+      const { data, source } = await cached(`forex:${normalized}`, () => fetchForex(pair, env));
+      return jsonResponse({ source, data });
+    }
+
+    if (url.pathname === "/api/all") {
+      const symbol = params.get("symbol");
+      const crypto = params.get("crypto");
+      const forex = params.get("forex");
+
+      const result = {};
+      if (symbol) {
+        const { data } = await cached(`stock:${symbol.toUpperCase()}`, () => fetchStock(symbol, env));
+        result.stock = data;
+      }
+      if (crypto) {
+        const { data } = await cached(`crypto:${crypto.toUpperCase()}`, () => fetchCrypto(crypto));
+        result.crypto = data;
+      }
+      if (forex) {
+        const normalized = forex.toUpperCase().replace("/", "");
+        const { data } = await cached(`forex:${normalized}`, () => fetchForex(forex, env));
+        result.forex = data;
+      }
+      return jsonResponse(result);
+    }
+
+    const res = createErrorResponse('Not Found', 404, 'not_found');
+    logEvent({ requestId: "data", path: url.pathname, status: res.status, durationMs: Date.now() - started, note: "data_not_found" });
+    return res;
+  } catch (e) {
+    const res = createErrorResponse(e.message, 500, 'api_error');
+    logEvent({ requestId: "data", path: url.pathname, status: res.status, durationMs: Date.now() - started, note: e.message });
+    return res;
+  }
+}
+
+async function withCache(env, key, fetcher, hotTtlMs, warmTtlSec) {
+  const hot = getCache(key);
+  if (hot !== null && hot !== undefined) {
+    return { data: hot, source: "memory" };
+  }
+
+  const warm = await getKV(env, key);
+  if (warm !== null && warm !== undefined) {
+    setCache(key, warm, hotTtlMs);
+    return { data: warm, source: "kv" };
+  }
+
+  const data = await fetcher();
+  setCache(key, data, hotTtlMs);
+  await setKV(env, key, data, warmTtlSec);
+  return { data, source: "api" };
 }
 
 // --- 辅助函数 ---
@@ -306,7 +439,34 @@ function verifyAuth(request) {
   const auth = request.headers.get('Authorization');
   const key = request.ctx.apiKey;
   if (key === "1") return true;
-  return auth === `Bearer ${key}`;
+  if (auth === `Bearer ${key}`) return true;
+
+  const cookieAuth = getCookie(request.headers.get('Cookie'), 'api_token');
+  return cookieAuth === key;
+}
+
+function getCookie(cookieHeader, name) {
+  if (!cookieHeader) return null;
+  const parts = cookieHeader.split(';');
+  for (const part of parts) {
+    const [k, v] = part.trim().split('=');
+    if (k === name) return decodeURIComponent(v || '');
+  }
+  return null;
+}
+
+function estimateTokensFromMessages(messages = []) {
+  let total = 0;
+  for (const msg of messages) {
+    if (typeof msg?.content === 'string') {
+      total += estimateTokens(msg.content);
+    }
+  }
+  return total;
+}
+
+function estimateTokens(text = "") {
+  return Math.max(1, Math.ceil(text.length / 4));
 }
 
 function generateRandomId(length) {
@@ -335,7 +495,7 @@ function handleCorsPreflight() {
   return new Response(null, { status: 204, headers: corsHeaders() });
 }
 
-// --- [第四部分: 开发者驾驶舱 UI] ---
+// --- [第五部分: 开发者驾驶舱 UI] ---
 function handleUI(request) {
   const origin = new URL(request.url).origin;
   const apiKey = request.ctx.apiKey;
@@ -374,11 +534,6 @@ function handleUI(request) {
     <div class="sidebar">
         <h2 style="margin-top:0">🚀 ${CONFIG.PROJECT_NAME} <span style="font-size:12px;color:#888">v${CONFIG.PROJECT_VERSION}</span></h2>
         
-        <div class="box">
-            <span class="label">API 密钥 (点击复制)</span>
-            <div class="code-block" onclick="copy('${apiKey}')">${apiKey}</div>
-        </div>
-
         <div class="box">
             <span class="label">API 接口地址</span>
             <div class="code-block" onclick="copy('${origin}/v1/chat/completions')">${origin}/v1/chat/completions</div>
@@ -423,7 +578,6 @@ function handleUI(request) {
     </main>
 
     <script>
-        const API_KEY = "${apiKey}";
         const ENDPOINT = "${origin}/v1/chat/completions";
         
         function log(msg) {
@@ -473,10 +627,8 @@ function handleUI(request) {
             try {
                 const res = await fetch(ENDPOINT, {
                     method: 'POST',
-                    headers: { 
-                        'Authorization': 'Bearer ' + API_KEY, 
-                        'Content-Type': 'application/json' 
-                    },
+                    credentials: 'include',
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         model: model,
                         messages: [{ role: 'user', content: prompt }],
@@ -531,5 +683,6 @@ function handleUI(request) {
 </body>
 </html>`;
 
-  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  const cookie = `api_token=${encodeURIComponent(apiKey)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400`;
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Set-Cookie': cookie } });
 }
