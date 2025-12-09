@@ -40,6 +40,7 @@ const CONFIG = {
   // 上游服务配置
   UPSTREAM_ORIGIN: "https://free.stockai.trade",
   UPSTREAM_API_URL: "https://free.stockai.trade/api/chat",
+  UPSTREAM_FALLBACKS: [],
   
   // 伪装指纹 (基于 Chrome 142)
   HEADERS: {
@@ -81,7 +82,7 @@ export default {
     if (request.method === 'OPTIONS') return handleCorsPreflight();
 
     const apiKey = env.API_MASTER_KEY || CONFIG.API_MASTER_KEY;
-    request.ctx = { apiKey };
+    request.ctx = { apiKey, env };
 
     const url = new URL(request.url);
     const ip = request.headers.get("CF-Connecting-IP");
@@ -97,7 +98,7 @@ export default {
     const rl = await rateLimit(env, ip, cfg.limit, cfg.windowSec, scope);
     if (!rl.allowed) return rl.response;
 
-    if (route === "openai") return handleApi(request);
+    if (route === "openai") return handleApi(request, env);
     if (route === "data") return handleDataApi(request, env);
 
     return createErrorResponse(`路径未找到: ${url.pathname}`, 404, 'not_found');
@@ -111,7 +112,7 @@ function logEvent({ requestId, path, status = 200, durationMs = 0, note = "" }) 
   console.log(JSON.stringify(entry));
 }
 
-async function handleApi(request) {
+async function handleApi(request, env) {
   const started = Date.now();
   // 鉴权
   if (!verifyAuth(request)) {
@@ -129,7 +130,7 @@ async function handleApi(request) {
   }
 
   if (url.pathname === '/v1/chat/completions') {
-    const res = await handleChatCompletions(request, requestId);
+    const res = await handleChatCompletions(request, requestId, env);
     logEvent({ requestId, path: url.pathname, status: res.status, durationMs: Date.now() - started });
     return res;
   }
@@ -156,7 +157,7 @@ function handleModelsRequest() {
 }
 
 // 处理聊天请求 (核心逻辑)
-async function handleChatCompletions(request, requestId) {
+async function handleChatCompletions(request, requestId, env) {
   try {
     const body = await request.json();
     const model = body.model || CONFIG.DEFAULT_MODEL;
@@ -182,16 +183,13 @@ async function handleChatCompletions(request, requestId) {
       trigger: "submit-message"
     };
 
-    // 3. 发送请求
-    const response = await fetch(CONFIG.UPSTREAM_API_URL, {
-      method: "POST",
-      headers: CONFIG.HEADERS,
-      body: JSON.stringify(payload)
-    });
+    // 3. 发送请求 (带重试 + 备用上游)
+    const { response, upstream } = await fetchUpstreamWithRetry(payload, env);
 
     if (!response.ok) {
       const errText = await response.text();
-      throw new Error(`上游服务错误 (${response.status}): ${errText}`);
+      const msg = `上游服务错误 (${response.status}) [${upstream}]: ${errText}`;
+      return createErrorResponse(msg, response.status, 'upstream_error');
     }
 
     // 4. 处理响应
@@ -200,9 +198,9 @@ async function handleChatCompletions(request, requestId) {
     // 如果客户端请求 stream=false (如沉浸式翻译)，我们需要消费整个流并拼接结果。
 
     if (stream) {
-      return handleStreamResponse(response, model, requestId, isWebUI);
+      return handleStreamResponse(response, model, requestId, isWebUI, upstream);
     } else {
-      return handleNonStreamResponse(response, model, requestId, promptTokens);
+      return handleNonStreamResponse(response, model, requestId, promptTokens, upstream);
     }
 
   } catch (e) {
@@ -211,7 +209,7 @@ async function handleChatCompletions(request, requestId) {
 }
 
 // 处理流式响应 (SSE -> SSE)
-function handleStreamResponse(upstreamResponse, model, requestId, isWebUI) {
+function handleStreamResponse(upstreamResponse, model, requestId, isWebUI, upstream) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -284,13 +282,13 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI) {
   })();
 
   return new Response(readable, {
-    headers: corsHeaders({ 'Content-Type': 'text/event-stream' })
+    headers: corsHeaders({ 'Content-Type': 'text/event-stream', 'X-Upstream': upstream || CONFIG.UPSTREAM_API_URL })
   });
 }
 
 // 处理非流式响应 (SSE -> JSON)
 // 适配沉浸式翻译等不支持流的插件
-async function handleNonStreamResponse(upstreamResponse, model, requestId, promptTokens = 0) {
+async function handleNonStreamResponse(upstreamResponse, model, requestId, promptTokens = 0, upstream) {
   const reader = upstreamResponse.body.getReader();
   const decoder = new TextDecoder();
   let fullText = "";
@@ -341,7 +339,7 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId, promp
   };
 
   return new Response(JSON.stringify(response), {
-    headers: corsHeaders({ 'Content-Type': 'application/json' })
+    headers: corsHeaders({ 'Content-Type': 'application/json', 'X-Upstream': upstream || CONFIG.UPSTREAM_API_URL })
   });
 }
 
@@ -494,6 +492,65 @@ function corsHeaders(headers = {}) {
 function handleCorsPreflight() {
   return new Response(null, { status: 204, headers: corsHeaders() });
 }
+
+// 轻量重试 + 备用上游
+async function fetchUpstreamWithRetry(payload, env) {
+  const upstreams = getUpstreamList(env);
+  const maxRetriesPerHost = 2;
+  const backoffBaseMs = 200;
+
+  for (const endpoint of upstreams) {
+    const headers = buildUpstreamHeaders(endpoint);
+    for (let attempt = 0; attempt < maxRetriesPerHost; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        });
+        clearTimeout(timeout);
+
+        if (res.ok) return { response: res, upstream: endpoint };
+
+        // 5xx/429 重试，否则立即返回
+        if ([429, 500, 502, 503, 504].includes(res.status) && attempt < maxRetriesPerHost - 1) {
+          await sleep(backoffBaseMs * (attempt + 1));
+          continue;
+        }
+        return { response: res, upstream: endpoint };
+      } catch (err) {
+        // 超时或网络错误时重试下一个
+        if (attempt < maxRetriesPerHost - 1) {
+          await sleep(backoffBaseMs * (attempt + 1));
+          continue;
+        }
+      }
+    }
+  }
+  throw new Error("上游不可用，请稍后重试");
+}
+
+function getUpstreamList(env) {
+  const primary = env?.UPSTREAM_API_URL || CONFIG.UPSTREAM_API_URL;
+  const fallbackStr = env?.UPSTREAM_FALLBACKS || (CONFIG.UPSTREAM_FALLBACKS || []).join(",");
+  const fallbacks = fallbackStr.split(",").map(s => s.trim()).filter(Boolean);
+  return [primary, ...fallbacks];
+}
+
+function buildUpstreamHeaders(endpoint) {
+  const url = new URL(endpoint);
+  return {
+    ...CONFIG.HEADERS,
+    authority: url.host,
+    origin: `${url.protocol}//${url.host}`,
+    referer: `${url.protocol}//${url.host}/`
+  };
+}
+
+const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
 // --- [第五部分: 开发者驾驶舱 UI] ---
 function handleUI(request) {
