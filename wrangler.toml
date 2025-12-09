@@ -4,7 +4,3 @@ compatibility_date = "2024-12-09"
 
 [vars]
 API_MASTER_KEY = "N1gh7f@ll99!"
-
-kv_namespaces = [
-  { binding = "STOCK_KV", id = "5509cae6a8e34007a70f746036e2b020" }
-]
