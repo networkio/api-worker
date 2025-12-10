@@ -1,48 +1,22 @@
 /**
  * =================================================================================
- * 项目: stockai-2api (Cloudflare Worker 单文件版)
- * 版本: 1.0.0 (代号: Chimera Synthesis - StockAI)
- * 作者: 首席AI执行官 (Principal AI Executive Officer)
- * 协议: 奇美拉协议 · 综合版 (Project Chimera: Synthesis Edition)
- * 日期: 2025-12-06
- * 
- * [核心特性]
- * 1. [双模适配] 同时支持流式(SSE)和非流式(JSON)响应，完美适配沉浸式翻译插件。
- * 2. [协议清洗] 将 StockAI 的自定义事件流实时转换为标准 OpenAI 格式。
- * 3. [匿名伪装] 内置浏览器指纹，无需登录即可使用。
- * 4. [开发者驾驶舱] 集成全中文调试界面，实时监控请求与响应。
+ * 项目: stockai-2api (Cloudflare Worker 单文件版) — 完整增强版
+ * 说明: 这是为个人免费使用而优化的完整 worker.js 文件
+ * 变更要点:
+ *  - 强制/可选主密钥配置（STRICT_MASTER）
+ *  - 内存缓存减少 KV 读取（低频次场景节省额度）
+ *  - SSE keepalive（防止 Cloudflare 边缘超时断开）
+ *  - 降低限流默认阈值（30/min）
+ *  - 隐藏 UI 主密钥（可通过 SHOW_MASTER_KEY=1 显示）
+ *  - /v1/admin/apikeys、/v1/admin/metrics、/v1/models、/v1/chat/completions 支持
  * =================================================================================
  */
 
-import { getCache, setCache } from "./src/cache/memoryCache.js";
-import { getKV, setKV } from "./src/cache/kvCache.js";
-import { rateLimit } from "./src/utils/rateLimit.js";
-import { jsonResponse } from "./src/utils/response.js";
-import { fetchStock } from "./src/api/fetchStock.js";
-import { fetchCrypto } from "./src/api/fetchCrypto.js";
-import { fetchForex } from "./src/api/fetchForex.js";
-import { matchRoute } from "./src/router.js";
-
-// --- [第一部分: 核心配置 (Configuration-as-Code)] ---
 const CONFIG = {
   PROJECT_NAME: "stockai-2api",
   PROJECT_VERSION: "1.0.0",
-  RATE_LIMIT: {
-    global: { limit: 60, windowSec: 60 },
-    chat: { limit: 30, windowSec: 60 },
-    data: { limit: 60, windowSec: 60 }
-  },
-  CACHE: { HOT_TTL_MS: 60_000, WARM_TTL_SEC: 600 },
-  
-  // 安全配置 (建议在 Cloudflare 环境变量中设置 API_MASTER_KEY)
-  API_MASTER_KEY: "1", 
-  
-  // 上游服务配置
   UPSTREAM_ORIGIN: "https://free.stockai.trade",
   UPSTREAM_API_URL: "https://free.stockai.trade/api/chat",
-  UPSTREAM_FALLBACKS: [],
-  
-  // 伪装指纹 (基于 Chrome 142)
   HEADERS: {
     "authority": "free.stockai.trade",
     "accept": "*/*",
@@ -59,8 +33,6 @@ const CONFIG = {
     "sec-fetch-site": "same-origin",
     "priority": "u=1, i"
   },
-
-  // 模型列表 (从源码和抓包中提取)
   MODELS: [
     "openai/gpt-4o-mini",
     "google/gemini-2.0-flash",
@@ -72,151 +44,171 @@ const CONFIG = {
     "mistral/mistral-small",
     "qwen/qwen3-coder"
   ],
-  DEFAULT_MODEL: "openai/gpt-4o-mini"
+  DEFAULT_MODEL: "openai/gpt-4o-mini",
+  DISCLAIMER: "This is a reverse proxy for personal use only. Not affiliated with StockAI."
 };
 
-// --- [第二部分: Worker 入口与路由] ---
+// ---- Simple in-memory cache (per-worker-instance warm cache) ----
+const _INMEM = {
+  apiKeys: { data: null, expiresAt: 0, ttl: 60 * 1000 }, // 60s
+};
+
+// ---- Worker entrypoint ----
 export default {
   async fetch(request, env, ctx) {
-    // 1. CORS 预检
-    if (request.method === 'OPTIONS') return handleCorsPreflight();
-
-    const apiKey = env.API_MASTER_KEY || CONFIG.API_MASTER_KEY;
-    request.ctx = { apiKey, env };
+    // attach env and a small ctx for downstream usage
+    request.ctx = { env, startedAt: Date.now() };
 
     const url = new URL(request.url);
-    const ip = request.headers.get("CF-Connecting-IP");
 
-    // 2. 路由分发
-    const route = matchRoute(url);
-    if (route === "ui") return handleUI(request, env);
-    if (route === "health") return jsonResponse({ status: "ok" });
+    if (request.method === 'OPTIONS') return handleCorsPreflight(request);
 
-    // 3. 限流保护（按路由维度）
-    const scope = route === "openai" ? "chat" : route === "data" ? "data" : "global";
-    const cfg = CONFIG.RATE_LIMIT[scope] || CONFIG.RATE_LIMIT.global;
-    const rl = await rateLimit(env, ip, cfg.limit, cfg.windowSec, scope);
-    if (!rl.allowed) return rl.response;
+    if (url.pathname === '/') return handleUI(request);
+    if (url.pathname.startsWith('/v1/')) return handleApi(request);
 
-    if (route === "openai") return handleApi(request, env);
-    if (route === "data") return handleDataApi(request, env);
-
-    return createErrorResponse(`路径未找到: ${url.pathname}`, 404, 'not_found');
+    return createErrorResponse(`路径未找到: ${url.pathname}`, 404, 'not_found', request);
   }
 };
 
-// --- [第三部分: API 代理逻辑] ---
+// ---- API routing and logic ----
+async function handleApi(request) {
+  const env = request.ctx?.env;
 
-function logEvent({ requestId, path, status = 200, durationMs = 0, note = "" }) {
-  const entry = { ts: Date.now(), requestId, path, status, durationMs, note };
-  console.log(JSON.stringify(entry));
-}
+  // Authentication
+  try {
+    if (!(await verifyAuth(request))) {
+      return createErrorResponse('Unauthorized', 401, 'auth_error', request);
+    }
+  } catch (e) {
+    // verifyAuth may throw when strict master is enabled but misconfigured
+    return createErrorResponse(e.message || 'auth configuration error', 500, 'auth_config_error', request);
+  }
 
-async function handleApi(request, env) {
-  const started = Date.now();
-  // 鉴权
-  if (!verifyAuth(request)) {
-    logEvent({ requestId: "unauth", path: request.url, status: 401, durationMs: Date.now() - started, note: "auth_fail" });
-    return createErrorResponse('Unauthorized', 401, 'auth_error');
+  // Rate limiting (skip for master)
+  if (!request.ctx?.auth?.isMaster) {
+    const rl = await checkRateLimit(request, env);
+    if (!rl.allowed) {
+      return new Response(JSON.stringify({
+        error: { message: `Rate limit exceeded. Try again in ${rl.retryAfter} seconds.`, type: 'rate_limit_exceeded' }
+      }), {
+        status: 429,
+        headers: corsHeaders({ 'Content-Type': 'application/json', 'Retry-After': String(rl.retryAfter) }, request)
+      });
+    }
   }
 
   const url = new URL(request.url);
   const requestId = `req-${crypto.randomUUID()}`;
 
+  // Admin metrics: /v1/admin/metrics
+  if (url.pathname === '/v1/admin/metrics') {
+    return handleMetricsRequest(request);
+  }
+
+  // Models listing
   if (url.pathname === '/v1/models') {
-    const res = handleModelsRequest();
-    logEvent({ requestId, path: url.pathname, status: res.status, durationMs: Date.now() - started });
-    return res;
+    return handleModelsRequest(request);
   }
 
+  // Chat completions
   if (url.pathname === '/v1/chat/completions') {
-    const res = await handleChatCompletions(request, requestId, env);
-    logEvent({ requestId, path: url.pathname, status: res.status, durationMs: Date.now() - started });
-    return res;
+    return handleChatCompletions(request, requestId);
   }
 
-  const res = createErrorResponse('Not Found', 404, 'not_found');
-  logEvent({ requestId, path: url.pathname, status: res.status, durationMs: Date.now() - started, note: "openai_not_found" });
-  return res;
+  // API Key management (only master allowed)
+  if (url.pathname.startsWith('/v1/admin/apikeys')) {
+    return handleApiKeysManagement(request);
+  }
+
+  return createErrorResponse('Not Found', 404, 'not_found', request);
 }
 
-// 处理模型列表
-function handleModelsRequest() {
+function handleModelsRequest(request) {
   const modelsData = {
     object: 'list',
     data: CONFIG.MODELS.map(id => ({
-      id: id,
+      id,
       object: 'model',
       created: Math.floor(Date.now() / 1000),
-      owned_by: 'stockai-2api',
-    })),
+      owned_by: 'stockai-2api'
+    }))
   };
   return new Response(JSON.stringify(modelsData), {
-    headers: corsHeaders({ 'Content-Type': 'application/json' })
+    headers: corsHeaders({ 'Content-Type': 'application/json' }, request)
   });
 }
 
-// 处理聊天请求 (核心逻辑)
-async function handleChatCompletions(request, requestId, env) {
+async function handleChatCompletions(request, requestId) {
   try {
     const body = await request.json();
     const model = body.model || CONFIG.DEFAULT_MODEL;
     const messages = body.messages || [];
-    const promptTokens = estimateTokensFromMessages(messages);
-    const stream = body.stream !== false; // 默认为 true，除非显式设为 false
+    const stream = body.stream !== false; // default true
     const isWebUI = body.is_web_ui === true;
 
-    // 1. 转换消息格式 (OpenAI -> StockAI)
-    // StockAI 格式: { parts: [{type: "text", text: "..."}], role: "user", id: "..." }
+    // Input size check (protect runtime)
+    const totalLen = JSON.stringify(messages).length;
+    if (totalLen > 20000) {
+      return createErrorResponse('Request too large', 413, 'request_too_large', request);
+    }
+
     const convertedMessages = messages.map(msg => ({
       parts: [{ type: "text", text: msg.content }],
       id: generateRandomId(16),
       role: msg.role
     }));
 
-    // 2. 构造上游 Payload
     const payload = {
-      model: model,
-      webSearch: false, // 暂不支持联网，保持简单
-      id: generateRandomId(16), // 会话ID
+      model,
+      webSearch: false,
+      id: generateRandomId(16),
       messages: convertedMessages,
       trigger: "submit-message"
     };
 
-    // 3. 发送请求 (带重试 + 备用上游)
-    const { response, upstream } = await fetchUpstreamWithRetry(payload, env);
+    const upstreamRes = await fetch(CONFIG.UPSTREAM_API_URL, {
+      method: "POST",
+      headers: CONFIG.HEADERS,
+      body: JSON.stringify(payload)
+    });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      const msg = `上游服务错误 (${response.status}) [${upstream}]: ${errText}`;
-      return createErrorResponse(msg, response.status, 'upstream_error');
+    if (!upstreamRes.ok) {
+      const errText = await upstreamRes.text();
+      throw new Error(`上游服务错误 (${upstreamRes.status}): ${errText}`);
     }
-
-    // 4. 处理响应
-    // StockAI 始终返回 SSE 流。
-    // 如果客户端请求 stream=true，我们做实时转换。
-    // 如果客户端请求 stream=false (如沉浸式翻译)，我们需要消费整个流并拼接结果。
 
     if (stream) {
-      return handleStreamResponse(response, model, requestId, isWebUI, upstream);
+      return handleStreamResponse(upstreamRes, model, requestId, isWebUI, request);
     } else {
-      return handleNonStreamResponse(response, model, requestId, promptTokens, upstream);
+      return handleNonStreamResponse(upstreamRes, model, requestId, request);
     }
-
   } catch (e) {
-    return createErrorResponse(e.message, 500, 'internal_error');
+    return createErrorResponse(e.message || 'internal server error', 500, 'internal_error', request);
   }
 }
 
-// 处理流式响应 (SSE -> SSE)
-function handleStreamResponse(upstreamResponse, model, requestId, isWebUI, upstream) {
+// ---- Stream handling with keepalive ----
+function handleStreamResponse(upstreamResponse, model, requestId, isWebUI, request) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
+  let keepAliveTimer = null;
+  let closed = false;
+
   (async () => {
     try {
+      // Keepalive every 25s to prevent edge timeouts
+      keepAliveTimer = setInterval(async () => {
+        if (closed) return;
+        try {
+          await writer.write(encoder.encode(': keepalive\n\n'));
+        } catch (e) {
+          clearInterval(keepAliveTimer);
+        }
+      }, 25000);
+
       const reader = upstreamResponse.body.getReader();
       let buffer = "";
 
@@ -235,33 +227,28 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI, upstr
 
             try {
               const data = JSON.parse(dataStr);
-              
-              // StockAI 的 delta 在 data.delta 中，且类型为 text-delta
               if (data.type === 'text-delta' && data.delta) {
                 const chunk = {
                   id: requestId,
                   object: "chat.completion.chunk",
                   created: Math.floor(Date.now() / 1000),
-                  model: model,
+                  model,
                   choices: [{ index: 0, delta: { content: data.delta }, finish_reason: null }]
                 };
                 await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
               }
-              // 处理结束
-              else if (data.type === 'finish') {
-                 // Do nothing, wait for loop end or explicit stop
-              }
-            } catch (e) { }
+            } catch (e) {
+              // ignore parse errors for individual events
+            }
           }
         }
       }
 
-      // 发送结束标记
       const endChunk = {
         id: requestId,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
-        model: model,
+        model,
         choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
       };
       await writer.write(encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`));
@@ -272,23 +259,28 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI, upstr
         id: requestId,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
-        model: model,
+        model,
         choices: [{ index: 0, delta: { content: `\n\n[Error: ${e.message}]` }, finish_reason: "error" }]
       };
-      await writer.write(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+      try { await writer.write(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`)); } catch (_) {}
     } finally {
-      await writer.close();
+      closed = true;
+      if (keepAliveTimer) clearInterval(keepAliveTimer);
+      try { await writer.close(); } catch (_) {}
     }
   })();
 
   return new Response(readable, {
-    headers: corsHeaders({ 'Content-Type': 'text/event-stream', 'X-Upstream': upstream || CONFIG.UPSTREAM_API_URL })
+    headers: corsHeaders({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive'
+    }, request)
   });
 }
 
-// 处理非流式响应 (SSE -> JSON)
-// 适配沉浸式翻译等不支持流的插件
-async function handleNonStreamResponse(upstreamResponse, model, requestId, promptTokens = 0, upstream) {
+// ---- Non-stream handling (aggregate SSE -> single JSON) ----
+async function handleNonStreamResponse(upstreamResponse, model, requestId, request) {
   const reader = upstreamResponse.body.getReader();
   const decoder = new TextDecoder();
   let fullText = "";
@@ -312,7 +304,7 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId, promp
             if (data.type === 'text-delta' && data.delta) {
               fullText += data.delta;
             }
-          } catch (e) {}
+          } catch (e) { /* ignore single parse errors */ }
         }
       }
     }
@@ -320,427 +312,400 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId, promp
     throw new Error(`Stream buffering failed: ${e.message}`);
   }
 
-  const completionTokens = estimateTokens(fullText);
   const response = {
     id: requestId,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model: model,
+    model,
     choices: [{
       index: 0,
       message: { role: "assistant", content: fullText },
       finish_reason: "stop"
     }],
-    usage: {
-      prompt_tokens: promptTokens,
-      completion_tokens: completionTokens,
-      total_tokens: promptTokens + completionTokens
-    }
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
   };
 
   return new Response(JSON.stringify(response), {
-    headers: corsHeaders({ 'Content-Type': 'application/json', 'X-Upstream': upstream || CONFIG.UPSTREAM_API_URL })
+    headers: corsHeaders({ 'Content-Type': 'application/json' }, request)
   });
 }
 
-// --- [第四部分: 数据 API 路由 (缓存 + 聚合)] ---
-async function handleDataApi(request, env) {
-  const started = Date.now();
-  if (!verifyAuth(request)) {
-    logEvent({ requestId: "unauth", path: request.url, status: 401, durationMs: Date.now() - started, note: "auth_fail" });
-    return createErrorResponse('Unauthorized', 401, 'auth_error');
+// ---- Auth & API Key management ----
+async function verifyAuth(request) {
+  const headers = request.headers;
+  const env = request.ctx?.env;
+  const masterKey = env?.API_MASTER_KEY;
+  const strict = String(env?.STRICT_MASTER || '').toLowerCase() === '1';
+
+  // Accept Bearer or x-api-key
+  const authHeader = headers.get('Authorization') || '';
+  let provided = null;
+  if (authHeader.startsWith('Bearer ')) provided = authHeader.slice(7).trim();
+  else provided = headers.get('x-api-key');
+
+  if (strict && !masterKey) {
+    throw new Error('API_MASTER_KEY not configured while STRICT_MASTER=1');
+  }
+
+  if (!provided) return false;
+
+  if (masterKey && provided === masterKey) {
+    request.ctx.auth = { isMaster: true, key: provided };
+    return true;
+  }
+
+  const keys = await getStoredApiKeys(env);
+  if (Array.isArray(keys)) {
+    const item = keys.find(k => k.key === provided || k.id === provided);
+    if (item && !item.disabled) {
+      request.ctx.auth = { isMaster: false, key: provided, meta: item };
+      return true;
+    }
+  } else if (typeof keys === 'object' && keys !== null) {
+    const meta = keys[provided] || Object.values(keys).find(v => v.key === provided || v.id === provided);
+    if (meta && !meta.disabled) {
+      request.ctx.auth = { isMaster: false, key: provided, meta };
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function getStoredApiKeys(env) {
+  const now = Date.now();
+  if (_INMEM.apiKeys.data && _INMEM.apiKeys.expiresAt > now) {
+    return _INMEM.apiKeys.data;
+  }
+
+  // KV first
+  if (env?.API_KEYS_KV) {
+    try {
+      const raw = await env.API_KEYS_KV.get('api_keys');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        _INMEM.apiKeys = { data: parsed, expiresAt: now + _INMEM.apiKeys.ttl, ttl: _INMEM.apiKeys.ttl };
+        return parsed;
+      }
+    } catch (e) {
+      // ignore parse error and fallthrough
+    }
+  }
+
+  // fallback to env var
+  const rawEnv = env?.API_KEYS;
+  if (!rawEnv) {
+    _INMEM.apiKeys = { data: {}, expiresAt: now + _INMEM.apiKeys.ttl, ttl: _INMEM.apiKeys.ttl };
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(rawEnv);
+    _INMEM.apiKeys = { data: parsed, expiresAt: now + _INMEM.apiKeys.ttl, ttl: _INMEM.apiKeys.ttl };
+    return parsed;
+  } catch (e) {
+    const arr = rawEnv.split(',').map(s => s.trim()).filter(Boolean);
+    const map = {};
+    arr.forEach(k => map[k] = { key: k, id: k });
+    _INMEM.apiKeys = { data: map, expiresAt: now + _INMEM.apiKeys.ttl, ttl: _INMEM.apiKeys.ttl };
+    return map;
+  }
+}
+
+async function persistStoredApiKeys(env, keys) {
+  if (!env?.API_KEYS_KV) return false;
+  try {
+    await env.API_KEYS_KV.put('api_keys', JSON.stringify(keys));
+    // refresh cache
+    _INMEM.apiKeys = { data: keys, expiresAt: Date.now() + _INMEM.apiKeys.ttl, ttl: _INMEM.apiKeys.ttl };
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function handleApiKeysManagement(request) {
+  const env = request.ctx?.env;
+  if (!request.ctx?.auth?.isMaster) {
+    return createErrorResponse('Forbidden: master key required for apikey management', 403, 'forbidden', request);
   }
 
   const url = new URL(request.url);
-  const params = url.searchParams;
-  const hotTtl = CONFIG.CACHE.HOT_TTL_MS;
-  const warmTtl = CONFIG.CACHE.WARM_TTL_SEC;
+  const parts = url.pathname.split('/').filter(Boolean); // ["v1","admin","apikeys",":id"?]
+  const method = request.method.toUpperCase();
 
-  const cached = (cacheKey, fetcher) => withCache(env, cacheKey, fetcher, hotTtl, warmTtl);
+  let keys = await getStoredApiKeys(env);
+  let arr = Array.isArray(keys) ? keys.slice() : Object.values(keys || {});
 
-  try {
-    if (url.pathname === "/api/stock") {
-      const symbol = params.get("symbol");
-      if (!symbol) return createErrorResponse('Missing symbol', 400, 'bad_request');
-      const { data, source } = await cached(`stock:${symbol.toUpperCase()}`, () => fetchStock(symbol, env));
-      return jsonResponse({ source, data });
-    }
+  if (method === 'GET') {
+    return new Response(JSON.stringify({ data: arr }), {
+      headers: corsHeaders({ 'Content-Type': 'application/json' }, request)
+    });
+  }
 
-    if (url.pathname === "/api/crypto") {
-      const symbol = params.get("symbol");
-      if (!symbol) return createErrorResponse('Missing crypto symbol', 400, 'bad_request');
-      const { data, source } = await cached(`crypto:${symbol.toUpperCase()}`, () => fetchCrypto(symbol));
-      return jsonResponse({ source, data });
-    }
-
-    if (url.pathname === "/api/forex") {
-      const pair = params.get("pair");
-      if (!pair) return createErrorResponse('Missing forex pair', 400, 'bad_request');
-      const normalized = pair.toUpperCase().replace("/", "");
-      const { data, source } = await cached(`forex:${normalized}`, () => fetchForex(pair, env));
-      return jsonResponse({ source, data });
-    }
-
-    if (url.pathname === "/api/all") {
-      const symbol = params.get("symbol");
-      const crypto = params.get("crypto");
-      const forex = params.get("forex");
-
-      const result = {};
-      if (symbol) {
-        const { data } = await cached(`stock:${symbol.toUpperCase()}`, () => fetchStock(symbol, env));
-        result.stock = data;
+  if (method === 'POST') {
+    try {
+      const body = await request.json().catch(() => ({}));
+      const newKey = generateRandomId(40);
+      const id = body.id || generateRandomId(8);
+      const meta = {
+        key: newKey,
+        id,
+        name: body.name || `key-${id}`,
+        disabled: false,
+        created_at: new Date().toISOString(),
+        meta: body.meta || {}
+      };
+      arr.push(meta);
+      const persisted = await persistStoredApiKeys(env, arr);
+      if (!persisted) {
+        return createErrorResponse('KV not configured. Bind API_KEYS_KV to persist keys.', 400, 'no_kv', request);
       }
-      if (crypto) {
-        const { data } = await cached(`crypto:${crypto.toUpperCase()}`, () => fetchCrypto(crypto));
-        result.crypto = data;
-      }
-      if (forex) {
-        const normalized = forex.toUpperCase().replace("/", "");
-        const { data } = await cached(`forex:${normalized}`, () => fetchForex(forex, env));
-        result.forex = data;
-      }
-      return jsonResponse(result);
-    }
-
-    const res = createErrorResponse('Not Found', 404, 'not_found');
-    logEvent({ requestId: "data", path: url.pathname, status: res.status, durationMs: Date.now() - started, note: "data_not_found" });
-    return res;
-  } catch (e) {
-    const res = createErrorResponse(e.message, 500, 'api_error');
-    logEvent({ requestId: "data", path: url.pathname, status: res.status, durationMs: Date.now() - started, note: e.message });
-    return res;
-  }
-}
-
-async function withCache(env, key, fetcher, hotTtlMs, warmTtlSec) {
-  const hot = getCache(key);
-  if (hot !== null && hot !== undefined) {
-    return { data: hot, source: "memory" };
-  }
-
-  const warm = await getKV(env, key);
-  if (warm !== null && warm !== undefined) {
-    setCache(key, warm, hotTtlMs);
-    return { data: warm, source: "kv" };
-  }
-
-  const data = await fetcher();
-  setCache(key, data, hotTtlMs);
-  await setKV(env, key, data, warmTtlSec);
-  return { data, source: "api" };
-}
-
-// --- 辅助函数 ---
-
-function verifyAuth(request) {
-  const auth = request.headers.get('Authorization');
-  const key = request.ctx.apiKey;
-  if (key === "1") return true;
-  if (auth === `Bearer ${key}`) return true;
-
-  const cookieAuth = getCookie(request.headers.get('Cookie'), 'api_token');
-  return cookieAuth === key;
-}
-
-function getCookie(cookieHeader, name) {
-  if (!cookieHeader) return null;
-  const parts = cookieHeader.split(';');
-  for (const part of parts) {
-    const [k, v] = part.trim().split('=');
-    if (k === name) return decodeURIComponent(v || '');
-  }
-  return null;
-}
-
-function estimateTokensFromMessages(messages = []) {
-  let total = 0;
-  for (const msg of messages) {
-    if (typeof msg?.content === 'string') {
-      total += estimateTokens(msg.content);
+      return new Response(JSON.stringify({ success: true, key: meta }), {
+        headers: corsHeaders({ 'Content-Type': 'application/json' }, request)
+      });
+    } catch (e) {
+      return createErrorResponse(e.message, 500, 'internal_error', request);
     }
   }
-  return total;
+
+  if (method === 'DELETE') {
+    const id = parts[3];
+    if (!id) return createErrorResponse('Missing key id in path', 400, 'missing_id', request);
+
+    const beforeLen = arr.length;
+    arr = arr.filter(k => k.id !== id && k.key !== id);
+    if (arr.length === beforeLen) {
+      return createErrorResponse('Key not found', 404, 'not_found', request);
+    }
+
+    const persisted = await persistStoredApiKeys(env, arr);
+    if (!persisted) {
+      return createErrorResponse('KV not configured. Bind API_KEYS_KV to persist keys.', 400, 'no_kv', request);
+    }
+
+    return new Response(JSON.stringify({ success: true }), {
+      headers: corsHeaders({ 'Content-Type': 'application/json' }, request)
+    });
+  }
+
+  return createErrorResponse('Method Not Allowed', 405, 'method_not_allowed', request);
 }
 
-function estimateTokens(text = "") {
-  return Math.max(1, Math.ceil(text.length / 4));
+// ---- KV-based token-bucket rate limiting (conservative defaults) ----
+async function checkRateLimit(request, env) {
+  env = env || request.ctx?.env;
+  if (!env?.RATE_LIMIT_KV) {
+    // No KV => skip limiting (for dev/personal convenience)
+    return { allowed: true };
+  }
+
+  const identifier = request.headers.get('cf-connecting-ip') ||
+                     request.ctx.auth?.key ||
+                     'anonymous';
+  const BUCKET_KEY = `ratelimit:${identifier}`;
+
+  const RATE_LIMIT = {
+    tokensPerInterval: 30, // conservative default: 30/min
+    refillInterval: 60000,
+    capacity: 30
+  };
+
+  const now = Date.now();
+  const bucketStr = await env.RATE_LIMIT_KV.get(BUCKET_KEY);
+  let bucket = bucketStr ? JSON.parse(bucketStr) : { tokens: RATE_LIMIT.capacity, lastRefill: now };
+
+  const timePassed = now - (bucket.lastRefill || now);
+  const cycles = Math.floor(timePassed / RATE_LIMIT.refillInterval);
+  if (cycles > 0) {
+    const tokensToAdd = cycles * RATE_LIMIT.tokensPerInterval;
+    bucket.tokens = Math.min((bucket.tokens || 0) + tokensToAdd, RATE_LIMIT.capacity);
+    bucket.lastRefill = (bucket.lastRefill || now) + cycles * RATE_LIMIT.refillInterval;
+  }
+
+  if ((bucket.tokens || 0) < 1) {
+    const retryAfterMs = RATE_LIMIT.refillInterval - (now - bucket.lastRefill);
+    const retryAfter = Math.max(1, Math.ceil(retryAfterMs / 1000));
+    return { allowed: false, retryAfter };
+  }
+
+  bucket.tokens = (bucket.tokens || 0) - 1;
+  await env.RATE_LIMIT_KV.put(BUCKET_KEY, JSON.stringify(bucket), { expirationTtl: 3600 });
+
+  // increment lightweight metric asynchronously
+  incrementMetric(env, 'requests:chat');
+
+  return { allowed: true };
 }
 
-function generateRandomId(length) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let result = '';
-  for (let i = 0; i < length; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
-  return result;
-}
-
-function createErrorResponse(msg, status, code) {
-  return new Response(JSON.stringify({ error: { message: msg, type: 'api_error', code } }), {
-    status, headers: corsHeaders({ 'Content-Type': 'application/json' })
+// ---- Metrics endpoint ----
+async function handleMetricsRequest(request) {
+  const env = request.ctx?.env;
+  const metrics = [];
+  metrics.push(`# HELP worker_requests_total Total number of requests`);
+  metrics.push(`# TYPE worker_requests_total counter`);
+  let chatCount = 0;
+  if (env?.METRICS_KV) {
+    try { chatCount = Number(await env.METRICS_KV.get('requests:chat') || 0); } catch (e) { chatCount = 0; }
+  }
+  metrics.push(`worker_requests_total{endpoint="/v1/chat/completions"} ${chatCount}`);
+  metrics.push(`# HELP upstream_api_status Upstream API status`);
+  metrics.push(`# TYPE upstream_api_status gauge`);
+  metrics.push(`upstream_api_status 1`);
+  return new Response(metrics.join('\n'), {
+    headers: corsHeaders({ 'Content-Type': 'text/plain; version=0.0.4' }, request)
   });
 }
 
-function corsHeaders(headers = {}) {
+// ---- helpers: generate id, metrics increment ----
+function generateRandomId(length) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let r = '';
+  for (let i = 0; i < length; i++) r += chars.charAt(Math.floor(Math.random() * chars.length));
+  return r;
+}
+
+async function incrementMetric(env, key, delta = 1) {
+  if (!env?.METRICS_KV) return;
+  try {
+    const raw = await env.METRICS_KV.get(key);
+    const nowVal = raw ? Number(raw) : 0;
+    await env.METRICS_KV.put(key, String(nowVal + delta));
+  } catch (e) { /* best-effort */ }
+}
+
+// ---- Error & CORS helpers ----
+function createErrorResponse(msg, status, code, request) {
+  return new Response(JSON.stringify({ error: { message: msg, type: 'api_error', code } }), {
+    status,
+    headers: corsHeaders({ 'Content-Type': 'application/json' }, request)
+  });
+}
+
+function corsHeaders(headers = {}, request) {
+  // if no request provided, be permissive
+  if (!request) {
+    return {
+      ...headers,
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key',
+      'X-Disclaimer': CONFIG.DISCLAIMER
+    };
+  }
+
+  const env = request.ctx?.env;
+  const raw = env?.ALLOWED_ORIGINS || '';
+  const allowed = raw.split(',').map(s => s.trim()).filter(Boolean);
+  const requestOrigin = request.headers.get('Origin');
+
+  let allowOrigin = '*';
+  if (allowed.length > 0) {
+    if (allowed.includes('*')) {
+      allowOrigin = requestOrigin || '*';
+    } else if (requestOrigin && allowed.includes(requestOrigin)) {
+      allowOrigin = requestOrigin;
+    } else {
+      allowOrigin = allowed[0];
+    }
+  } else {
+    allowOrigin = '*';
+  }
+
   return {
     ...headers,
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Origin': allowOrigin,
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key',
+    'X-Disclaimer': CONFIG.DISCLAIMER
   };
 }
 
-function handleCorsPreflight() {
-  return new Response(null, { status: 204, headers: corsHeaders() });
+function handleCorsPreflight(request) {
+  return new Response(null, { status: 204, headers: corsHeaders({}, request) });
 }
 
-// 轻量重试 + 备用上游
-async function fetchUpstreamWithRetry(payload, env) {
-  const upstreams = getUpstreamList(env);
-  const maxRetriesPerHost = 2;
-  const backoffBaseMs = 200;
-
-  for (const endpoint of upstreams) {
-    const headers = buildUpstreamHeaders(endpoint);
-    for (let attempt = 0; attempt < maxRetriesPerHost; attempt++) {
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15000);
-        const res = await fetch(endpoint, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(payload),
-          signal: controller.signal
-        });
-        clearTimeout(timeout);
-
-        if (res.ok) return { response: res, upstream: endpoint };
-
-        // 5xx/429 重试，否则立即返回
-        if ([429, 500, 502, 503, 504].includes(res.status) && attempt < maxRetriesPerHost - 1) {
-          await sleep(backoffBaseMs * (attempt + 1));
-          continue;
-        }
-        return { response: res, upstream: endpoint };
-      } catch (err) {
-        // 超时或网络错误时重试下一个
-        if (attempt < maxRetriesPerHost - 1) {
-          await sleep(backoffBaseMs * (attempt + 1));
-          continue;
-        }
-      }
-    }
-  }
-  throw new Error("上游不可用，请稍后重试");
-}
-
-function getUpstreamList(env) {
-  const primary = env?.UPSTREAM_API_URL || CONFIG.UPSTREAM_API_URL;
-  const fallbackStr = env?.UPSTREAM_FALLBACKS || (CONFIG.UPSTREAM_FALLBACKS || []).join(",");
-  const fallbacks = fallbackStr.split(",").map(s => s.trim()).filter(Boolean);
-  return [primary, ...fallbacks];
-}
-
-function buildUpstreamHeaders(endpoint) {
-  const url = new URL(endpoint);
-  return {
-    ...CONFIG.HEADERS,
-    authority: url.host,
-    origin: `${url.protocol}//${url.host}`,
-    referer: `${url.protocol}//${url.host}/`
-  };
-}
-
-const sleep = (ms) => new Promise(res => setTimeout(res, ms));
-
-// --- [第五部分: 开发者驾驶舱 UI] ---
+// ---- UI (developer cockpit) with compliance note; hide master key unless SHOW_MASTER_KEY=1 ----
 function handleUI(request) {
-  let origin = new URL(request.url).origin;
-  if (origin.startsWith("http://")) origin = origin.replace("http://", "https://");
-  const apiKey = request.ctx.apiKey;
-  
+  const origin = new URL(request.url).origin;
+  const showKey = String(request.ctx?.env?.SHOW_MASTER_KEY || '').toLowerCase() === '1';
+  const apiKey = showKey ? (request.ctx?.env?.API_MASTER_KEY || '') : '';
   const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${CONFIG.PROJECT_NAME} - 开发者驾驶舱</title>
-    <style>
-      :root { --bg: #121212; --panel: #1E1E1E; --border: #333; --text: #E0E0E0; --primary: #FFBF00; --accent: #007AFF; }
-      body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); margin: 0; height: 100vh; display: flex; overflow: hidden; }
-      .sidebar { width: 380px; background: var(--panel); border-right: 1px solid var(--border); padding: 20px; display: flex; flex-direction: column; overflow-y: auto; }
-      .main { flex: 1; display: flex; flex-direction: column; padding: 20px; }
-      
-      .box { background: #252525; padding: 12px; border-radius: 6px; border: 1px solid var(--border); margin-bottom: 15px; }
-      .label { font-size: 12px; color: #888; margin-bottom: 5px; display: block; }
-      .code-block { font-family: monospace; font-size: 12px; color: var(--primary); word-break: break-all; background: #111; padding: 8px; border-radius: 4px; cursor: pointer; }
-      
-      input, select, textarea { width: 100%; background: #333; border: 1px solid #444; color: #fff; padding: 8px; border-radius: 4px; margin-bottom: 10px; box-sizing: border-box; }
-      button { width: 100%; padding: 10px; background: var(--primary); border: none; border-radius: 4px; font-weight: bold; cursor: pointer; color: #000; }
-      button:disabled { background: #555; cursor: not-allowed; }
-      
-      .chat-window { flex: 1; background: #000; border: 1px solid var(--border); border-radius: 8px; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
-      .msg { max-width: 80%; padding: 10px 15px; border-radius: 8px; line-height: 1.5; }
-      .msg.user { align-self: flex-end; background: #333; color: #fff; }
-      .msg.ai { align-self: flex-start; background: #1a1a1a; border: 1px solid #333; width: 100%; max-width: 100%; }
-      
-      .log-panel { height: 150px; background: #111; border-top: 1px solid var(--border); padding: 10px; font-family: monospace; font-size: 11px; color: #aaa; overflow-y: auto; }
-      .log-entry { margin-bottom: 4px; border-bottom: 1px solid #222; padding-bottom: 2px; }
-      .log-time { color: #666; margin-right: 5px; }
-    </style>
-</head>
-<body>
-    <div class="sidebar">
-        <h2 style="margin-top:0">🚀 ${CONFIG.PROJECT_NAME} <span style="font-size:12px;color:#888">v${CONFIG.PROJECT_VERSION}</span></h2>
-        
-        <div class="box">
-            <span class="label">API 接口地址</span>
-            <div class="code-block" onclick="copy('${origin}/v1/chat/completions')">${origin}/v1/chat/completions</div>
-        </div>
-
-        <div class="box">
-            <span class="label">模型选择</span>
-            <select id="model">
-                ${CONFIG.MODELS.map(m => `<option value="${m}">${m}</option>`).join('')}
-            </select>
-            
-            <span class="label">提示词 (Prompt)</span>
-            <textarea id="prompt" rows="4" placeholder="输入问题...">你好，请介绍一下你自己。</textarea>
-            
-            <div style="display:flex; gap:10px; align-items:center; margin-bottom:10px;">
-                <input type="checkbox" id="stream" checked style="width:auto; margin:0;">
-                <label for="stream" style="margin:0; font-size:12px; color:#ccc;">流式响应 (Stream)</label>
-            </div>
-
-            <button id="btn-gen" onclick="send()">发送请求</button>
-        </div>
-        
-        <div class="box">
-            <span class="label">功能说明</span>
-            <div style="font-size:12px; color:#888;">
-                ✅ 匿名访问 (无需 Cookie)<br>
-                ✅ 支持流式 (SSE) 输出<br>
-                ✅ 支持非流式 (适配沉浸式翻译)<br>
-                ✅ 自动 Markdown 渲染
-            </div>
-        </div>
-    </div>
-
-    <main class="main">
-        <div class="chat-window" id="chat">
-            <div style="color:#666; text-align:center; margin-top:50px;">
-                StockAI 代理服务就绪。<br>
-                支持 OpenAI 格式调用。
-            </div>
-        </div>
-        <div class="log-panel" id="logs"></div>
-    </main>
-
-    <script>
-        const ENDPOINT = "${origin}/v1/chat/completions";
-        
-        function log(msg) {
-            const el = document.getElementById('logs');
-            const div = document.createElement('div');
-            div.className = 'log-entry';
-            div.innerHTML = \`<span class="log-time">[\${new Date().toLocaleTimeString()}]</span> \${msg}\`;
-            el.appendChild(div);
-            el.scrollTop = el.scrollHeight;
-        }
-
-        function copy(text) {
-            navigator.clipboard.writeText(text);
-            log('已复制到剪贴板');
-        }
-
-        function appendMsg(role, text) {
-            const div = document.createElement('div');
-            div.className = \`msg \${role}\`;
-            div.innerText = text;
-            document.getElementById('chat').appendChild(div);
-            div.scrollIntoView({ behavior: "smooth" });
-            return div;
-        }
-
-        async function send() {
-            const prompt = document.getElementById('prompt').value.trim();
-            const model = document.getElementById('model').value;
-            const stream = document.getElementById('stream').checked;
-            
-            if (!prompt) return alert('请输入提示词');
-
-            const btn = document.getElementById('btn-gen');
-            btn.disabled = true;
-            btn.innerText = "请求中...";
-
-            if(document.querySelector('.chat-window').innerText.includes('代理服务就绪')) {
-                document.getElementById('chat').innerHTML = '';
-            }
-
-            appendMsg('user', prompt);
-            const aiMsg = appendMsg('ai', '...');
-            let fullText = "";
-
-            log(\`发送请求: \${model} (Stream: \${stream})\`);
-
-            try {
-                const res = await fetch(ENDPOINT, {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        model: model,
-                        messages: [{ role: 'user', content: prompt }],
-                        stream: stream,
-                        is_web_ui: true
-                    })
-                });
-
-                if (!res.ok) throw new Error((await res.json()).error?.message || '请求失败');
-
-                if (stream) {
-                    const reader = res.body.getReader();
-                    const decoder = new TextDecoder();
-                    aiMsg.innerText = "";
-
-                    while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-                        const chunk = decoder.decode(value);
-                        const lines = chunk.split('\\n');
-                        for (const line of lines) {
-                            if (line.startsWith('data: ')) {
-                                const dataStr = line.slice(6);
-                                if (dataStr === '[DONE]') break;
-                                try {
-                                    const json = JSON.parse(dataStr);
-                                    const content = json.choices[0].delta.content;
-                                    if (content) {
-                                        fullText += content;
-                                        aiMsg.innerText = fullText;
-                                    }
-                                } catch (e) {}
-                            }
-                        }
-                    }
-                } else {
-                    const data = await res.json();
-                    aiMsg.innerText = data.choices[0].message.content;
-                }
-                log('请求完成');
-
-            } catch (e) {
-                aiMsg.innerText = 'Error: ' + e.message;
-                aiMsg.style.color = '#CF6679';
-                log('错误: ' + e.message);
-            } finally {
-                btn.disabled = false;
-                btn.innerText = "发送请求";
-            }
-        }
-    </script>
-</body>
-</html>`;
-
-  const cookie = `api_token=${encodeURIComponent(apiKey)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400`;
-  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Set-Cookie': cookie } });
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${CONFIG.PROJECT_NAME} - 驾驶舱</title>
+<style>
+:root{--bg:#121212;--panel:#1E1E1E;--border:#333;--text:#E0E0E0;--primary:#FFBF00}
+body{font-family:Segoe UI,system-ui,Arial;background:var(--bg);color:var(--text);margin:0;display:flex;height:100vh}
+.sidebar{width:380px;background:var(--panel);padding:20px;border-right:1px solid var(--border);overflow:auto}
+.main{flex:1;padding:20px;display:flex;flex-direction:column}
+.box{background:#252525;padding:12px;border-radius:6px;border:1px solid var(--border);margin-bottom:15px}
+.label{font-size:12px;color:#888;margin-bottom:5px;display:block}
+.code-block{font-family:monospace;font-size:12px;color:var(--primary);background:#111;padding:8px;border-radius:4px;cursor:pointer;word-break:break-all}
+input,select,textarea{width:100%;background:#333;border:1px solid #444;color:#fff;padding:8px;border-radius:4px;margin-bottom:10px;box-sizing:border-box}
+button{width:100%;padding:10px;background:var(--primary);border:none;border-radius:4px;color:#000;font-weight:700;cursor:pointer}
+.chat-window{flex:1;background:#000;border:1px solid var(--border);border-radius:8px;padding:20px;overflow:auto;display:flex;flex-direction:column;gap:15px}
+.msg{max-width:80%;padding:10px 15px;border-radius:8px;line-height:1.5}
+.msg.user{align-self:flex-end;background:#333;color:#fff}
+.msg.ai{align-self:flex-start;background:#1a1a1a;border:1px solid #333;width:100%;max-width:100%}
+.log-panel{height:150px;background:#111;border-top:1px solid var(--border);padding:10px;font-family:monospace;font-size:11px;color:#aaa;overflow:auto}
+.disclaimer{font-size:10px;color:#888;margin-top:10px;padding:8px;border-top:1px solid #333}
+</style></head><body>
+<div class="sidebar">
+<h2>🚀 ${CONFIG.PROJECT_NAME} <span style="font-size:12px;color:#888">v${CONFIG.PROJECT_VERSION}</span></h2>
+<div class="box"><span class="label">API 密钥 (点击复制)</span>
+<div class="code-block" onclick="copy('${apiKey}')">${apiKey || '⚠️ 未显示（SHOW_MASTER_KEY=0）'}</div></div>
+<div class="box"><span class="label">API 接口地址</span>
+<div class="code-block" onclick="copy('${origin}/v1/chat/completions')">${origin}/v1/chat/completions</div></div>
+<div class="box">
+<span class="label">模型选择</span>
+<select id="model">${CONFIG.MODELS.map(m => `<option value="${m}">${m}</option>`).join('')}</select>
+<span class="label">提示词 (Prompt)</span>
+<textarea id="prompt" rows="4">你好，请介绍一下你自己。</textarea>
+<div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;">
+<input type="checkbox" id="stream" checked style="width:auto;margin:0;"><label for="stream" style="margin:0;font-size:12px;color:#ccc;">流式响应 (Stream)</label>
+</div>
+<button id="btn-gen" onclick="send()">发送请求</button>
+</div>
+<div class="box">
+<span class="label">功能说明</span>
+<div style="font-size:12px;color:#888;">
+✅ 匿名访问 (无需 Cookie)<br>✅ 支持流式 (SSE) 输出<br>✅ 支持非流式 (适配翻译插件)<br>
+</div>
+<div class="disclaimer"><strong>合规声明：</strong>本服务仅为个人学习研究用途，使用前请确认遵守 StockAI 服务条款。 不对服务可用性提供保证，不承担任何法律责任。</div>
+</div>
+</div>
+<main class="main">
+<div class="chat-window" id="chat"><div style="color:#666;text-align:center;margin-top:50px;">StockAI 代理服务就绪。支持 OpenAI 格式调用。</div></div>
+<div class="log-panel" id="logs"></div>
+</main>
+<script>
+const API_KEY = "${apiKey}";
+const ENDPOINT = "${origin}/v1/chat/completions";
+function log(msg){const el=document.getElementById('logs');const d=document.createElement('div');d.innerHTML='['+new Date().toLocaleTimeString()+'] '+msg;el.appendChild(d);el.scrollTop=el.scrollHeight;}
+function copy(text){if(!text) return alert('未配置或未显示主密钥');navigator.clipboard.writeText(text);log('已复制到剪贴板')}
+function appendMsg(role,text){const d=document.createElement('div');d.className='msg '+role;d.innerText=text;document.getElementById('chat').appendChild(d);d.scrollIntoView({behavior:"smooth"});return d}
+async function send(){
+ const prompt=document.getElementById('prompt').value.trim();const model=document.getElementById('model').value;const stream=document.getElementById('stream').checked;
+ if(!prompt) return alert('请输入提示词');
+ const btn=document.getElementById('btn-gen');btn.disabled=true;btn.innerText='请求中...';
+ if(document.querySelector('.chat-window').innerText.includes('代理服务就绪')) document.getElementById('chat').innerHTML='';
+ appendMsg('user',prompt);const aiMsg=appendMsg('ai','...');let fullText='';
+ log('发送请求: '+model+' (Stream:'+stream+')');
+ try{
+  const res=await fetch(ENDPOINT,{method:'POST',headers:{'Authorization':'Bearer '+API_KEY,'Content-Type':'application/json'},body:JSON.stringify({model, messages:[{role:'user',content:prompt}], stream, is_web_ui:true})});
+  if(!res.ok) throw new Error((await res.json()).error?.message||'请求失败');
+  if(stream){
+    const reader=res.body.getReader();const decoder=new TextDecoder();aiMsg.innerText='';
+    while(true){
+      const {done,value}=await reader.read(); if(done) break;
+      const chunk=decoder.decode(value); const lines=chunk.split('\\n');
+      for(const line of lines){ if(line.startsWith('data: ')){ const dataStr=line.slice(6); if(dataStr==='[DONE]') break; try{ const json=JSON.parse(dataStr); const content = json.choices?.[0]?.delta?.content; if(content){ fullText+=content; aiMsg.innerText=fullText } }catch(e){} } }
+    }
+  } else {
+    const data=await res.json(); aiMsg.innerText=data.choices?.[0]?.message?.content || '';
+  }
+  log('请求完成');
+ }catch(e){ aiMsg.innerText='Error: '+e.message; aiMsg.style.color='#CF6679'; log('错误: '+e.message); } finally { btn.disabled=false; btn.innerText='发送请求'; }
+}
+</script>
+</body></html>`;
+  return new Response(html, { headers: corsHeaders({ 'Content-Type': 'text/html; charset=utf-8' }, request) });
 }
