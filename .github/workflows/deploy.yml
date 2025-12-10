@@ -19,21 +19,16 @@ jobs:
         with:
           node-version: 20
 
-      - name: (Optional) Install Wrangler CLI for diagnostics
-        run: npm install -g wrangler@4
-
-      - name: Debug - whoami & kv list (will help diagnose binding/account issues)
+      - name: Debug - whoami & kv list (use npx to guarantee wrangler v4)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
-          wrangler whoami || true
-          wrangler kv:namespace list || true
+          echo "== wrangler whoami =="
+          npx --yes wrangler@4 whoami || true
+          echo "== wrangler kv:namespace list =="
+          npx --yes wrangler@4 kv:namespace list || true
 
       - name: Validate required KV namespaces exist
-        # This step uses wrangler to list KV namespaces (as JSON) and verifies
-        # that any configured secret IDs are present in the current account.
-        # Set the following repository secrets if you want them checked:
-        #   STOCK_KV_ID, API_KEYS_KV_ID, RATE_LIMIT_KV_ID, METRICS_KV_ID
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           STOCK_KV_ID: ${{ secrets.STOCK_KV_ID }}
@@ -42,14 +37,9 @@ jobs:
           METRICS_KV_ID: ${{ secrets.METRICS_KV_ID }}
         run: |
           set -euo pipefail
-          echo "Installing jq for JSON parsing..."
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
-          echo "Listing KV namespaces (JSON)..."
-          wrangler kv:namespace list --json > kvs.json || true
-          cat kvs.json
-
+          echo "Listing KV namespaces..."
+          npx --yes wrangler@4 kv:namespace list > kvs.txt || true
+          cat kvs.txt
           MISSING=0
 
           check_id() {
@@ -59,7 +49,7 @@ jobs:
               echo "Skipping check for $name (no secret provided)."
               return
             fi
-            if jq -e --arg id "$id" '.[] | select(.id == $id)' kvs.json >/dev/null 2>&1; then
+            if grep -q "$id" kvs.txt; then
               echo "Found $name with id $id"
             else
               echo "::error::$name with id $id not found in this account"
@@ -84,9 +74,9 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy --env ""
+          # Use name to avoid passing empty --env; deploy to top-level config
+          command: deploy --name stockai-2api
         env:
-          # Runtime variables provided to the worker at deploy time (do NOT commit real secrets)
           API_MASTER_KEY: ${{ secrets.API_MASTER_KEY }}
           ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
           API_KEYS: ${{ secrets.API_KEYS }}
