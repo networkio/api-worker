@@ -19,9 +19,6 @@ id = "bdd4828ebb1341b293fad17f11af03d1"
 binding = "RATE_LIMIT_KV"
 id = "98c41655cfed4f669e695026a6ed4f78"
 
-[[kv_namespaces]]
-binding = "METRICS_KV"
-id = "3b9f204e59fd4cd1933b2ee1f4d00d6e"
 
 # 可选 production 环境（若要部署到 production，请填写 account_id 并使用 --env production）
 [env.production]
