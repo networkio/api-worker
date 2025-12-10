@@ -6,7 +6,6 @@ workers_dev = true
 [dev]
 port = 8787
 
-# 已存在的绑定（你提供的 namespace ids）
 [[kv_namespaces]]
 binding = "STOCK_KV"
 id = "5509cae6a8e34007a70f746036e2b020"
@@ -15,18 +14,20 @@ id = "5509cae6a8e34007a70f746036e2b020"
 binding = "API_KEYS_KV"
 id = "bdd4828ebb1341b293fad17f11af03d1"
 
+# RATE_LIMIT_KV 临时注释，避免部署过程中出现 namespace not found 错误
+# [[kv_namespaces]]
+# binding = "RATE_LIMIT_KV"
+# id = "98c41655cfed4f669e695026a6ed4f78"
+
 [[kv_namespaces]]
-binding = "RATE_LIMIT_KV"
-id = "98c41655cfed4f669e695026a6ed4f78"
+binding = "METRICS_KV"
+id = "3b9f204e59fd4cd1933b2ee1f4d00d6e"
 
-
-# 可选 production 环境（若要部署到 production，请填写 account_id 并使用 --env production）
 [env.production]
 account_id = "<YOUR_CLOUDFLARE_ACCOUNT_ID>"
 workers_dev = false
 
 [env.production.vars]
-# 在 CI/CD 中通过环境变量注入这些值（不要把真实密钥提交到仓库）
 API_MASTER_KEY = "${API_MASTER_KEY}"
 ALLOWED_ORIGINS = "${ALLOWED_ORIGINS}"
 API_KEYS = "${API_KEYS}"
