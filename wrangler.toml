@@ -1,27 +1,34 @@
+name = "stockai-2api"
+main = "worker.js"
+compatibility_date = "2025-12-10"
+workers_dev = true
 
+[dev]
+port = 8787
 
-# 绑定 KV 命名空间 —— 在创建完 KV 后把 namespace_id 填入下列字段
+# 已存在的绑定（你提供的 namespace ids）
+[[kv_namespaces]]
+binding = "STOCK_KV"
+id = "5509cae6a8e34007a70f746036e2b020"
+
 [[kv_namespaces]]
 binding = "API_KEYS_KV"
-id = "<API_KEYS_KV_NAMESPACE_ID>"
+id = "bdd4828ebb1341b293fad17f11af03d1"
 
 [[kv_namespaces]]
 binding = "RATE_LIMIT_KV"
-id = "<RATE_LIMIT_KV_NAMESPACE_ID>"
+id = "98c41655cfed4f669e695026a6ed4f78"
 
 [[kv_namespaces]]
 binding = "METRICS_KV"
-id = "<METRICS_KV_NAMESPACE_ID>"
+id = "3b9f204e59fd4cd1933b2ee1f4d00d6e"
 
-# 可选：在 production 环境中设置不同的变量/绑定
+# 可选 production 环境（若要部署到 production，请填写 account_id 并使用 --env production）
 [env.production]
 account_id = "<YOUR_CLOUDFLARE_ACCOUNT_ID>"
-route = "" # 可选：填入你的 Worker route（例如: workers.yourdomain.com/*）
 workers_dev = false
 
-# 在 CI/CD 中会通过环境变量注入这些值（不要把真实密钥提交到仓库）
 [env.production.vars]
 API_MASTER_KEY = "${API_MASTER_KEY}"
 ALLOWED_ORIGINS = "${ALLOWED_ORIGINS}"
-# 你可以在 Cloudflare dashboard 的 Worker Variables 中设置 API_KEYS（备选）
 API_KEYS = "${API_KEYS}"
