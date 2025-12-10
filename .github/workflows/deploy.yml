@@ -25,15 +25,17 @@ jobs:
       - name: Debug - whoami & kv list (use wrangler v4 via npx)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           echo "== wrangler@4 whoami =="
-          npx --yes wrangler@4 whoami || true
+          npx --yes wrangler@4 --account-id "${CLOUDFLARE_ACCOUNT_ID}" whoami || true
           echo "== wrangler@4 kv:namespace list =="
-          npx --yes wrangler@4 kv:namespace list --json || npx --yes wrangler@4 kv:namespace list || true
+          npx --yes wrangler@4 --account-id "${CLOUDFLARE_ACCOUNT_ID}" kv:namespace list --json || npx --yes wrangler@4 --account-id "${CLOUDFLARE_ACCOUNT_ID}" kv:namespace list || true
 
       - name: Validate KV ids (optional, will skip if secrets not provided)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           STOCK_KV_ID: ${{ secrets.STOCK_KV_ID }}
           API_KEYS_KV_ID: ${{ secrets.API_KEYS_KV_ID }}
           RATE_LIMIT_KV_ID: ${{ secrets.RATE_LIMIT_KV_ID }}
@@ -41,7 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Checking provided KV ids against account visibility..."
-          ns_json="$(npx --yes wrangler@4 kv:namespace list --json 2>/dev/null || echo '[]')"
+          ns_json="$(npx --yes wrangler@4 --account-id "${CLOUDFLARE_ACCOUNT_ID}" kv:namespace list --json 2>/dev/null || echo '[]')"
           echo "$ns_json" | jq -r '.[] | "\(.id) \(.title)"' > namespaces.txt || true
           cat namespaces.txt || true
           check() {
@@ -73,4 +75,5 @@ jobs:
         run: |
           set -euo pipefail
           echo "Deploying with npx wrangler@4 (explicitly using v4 to avoid version mismatch)..."
-          npx --yes wrangler@4 deploy --name stockai-2api --account-id "${CLOUDFLARE_ACCOUNT_ID}"
+          # 正确的方式：--account-id 是全局标志，放在 wrangler 命令后
+          npx --yes wrangler@4 --account-id "${CLOUDFLARE_ACCOUNT_ID}" deploy --minify
