@@ -1,12 +1,13 @@
 name = "stockai-2api"
 main = "worker.js"
 compatibility_date = "2025-12-10"
-account_id = "<YOUR_CLOUDFLARE_ACCOUNT_ID>"  # 在这里设置账户ID
-workers_dev = true
+account_id = "<YOUR_CLOUDFLARE_ACCOUNT_ID>"  # 替换为您的真实账户ID
+workers_dev = true  # 使用 workers.dev 域名，设置为 false 则使用自定义域名
 
 [dev]
 port = 8787
 
+# KV 命名空间绑定
 [[kv_namespaces]]
 binding = "STOCK_KV"
 id = "5509cae6a8e34007a70f746036e2b020"
@@ -18,3 +19,18 @@ id = "bdd4828ebb1341b293fad17f11af03d1"
 [[kv_namespaces]]
 binding = "METRICS_KV"
 id = "3b9f204e59fd4cd1933b2ee1f4d00d6e"
+
+# RATE_LIMIT_KV（如果需要）
+[[kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "98c41655cfed4f669e695026a6ed4f78"
+
+# 基本变量配置（非敏感数据）
+[vars]
+STRICT_MASTER = "0"
+SHOW_MASTER_KEY = "1"
+DISCLAIMER = "This is a reverse proxy for personal use only. Not affiliated with StockAI."
+
+# 如果需要自定义域名，添加以下配置（取消注释并填写）：
+# route = "api.yourdomain.com/*"
+# zone_id = "<YOUR_ZONE_ID>"
