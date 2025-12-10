@@ -29,7 +29,6 @@ jobs:
           echo "== wrangler@4 whoami =="
           npx --yes wrangler@4 whoami || true
           echo "== wrangler@4 kv:namespace list =="
-          # List namespaces and print JSON; v4 supports --json for namespace list
           npx --yes wrangler@4 kv:namespace list --json || npx --yes wrangler@4 kv:namespace list || true
 
       - name: Validate KV ids (optional, will skip if secrets not provided)
@@ -70,9 +69,8 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           API_MASTER_KEY: ${{ secrets.API_MASTER_KEY }}
           ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
-          # keep other runtime vars as needed
+          API_KEYS: ${{ secrets.API_KEYS }}
         run: |
           set -euo pipefail
           echo "Deploying with npx wrangler@4 (explicitly using v4 to avoid version mismatch)..."
-          # ensure the runner uses the intended config (project root)
           npx --yes wrangler@4 deploy --name stockai-2api --account-id "${CLOUDFLARE_ACCOUNT_ID}"
