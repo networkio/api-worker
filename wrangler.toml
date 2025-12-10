@@ -1,11 +1,17 @@
 name = "stockai-2api"
 main = "worker.js"
 compatibility_date = "2025-12-10"
-workers_dev = true
+account_id = "<YOUR_CLOUDFLARE_ACCOUNT_ID>"  # 直接在这里设置账户ID
+workers_dev = true  # 设置为 false 如果要使用自定义域名
+
+# 如果需要自定义域名，添加以下配置：
+# route = "api.yourdomain.com/*"
+# zone_id = "<YOUR_ZONE_ID>"
 
 [dev]
 port = 8787
 
+# KV命名空间绑定
 [[kv_namespaces]]
 binding = "STOCK_KV"
 id = "5509cae6a8e34007a70f746036e2b020"
@@ -14,20 +20,12 @@ id = "5509cae6a8e34007a70f746036e2b020"
 binding = "API_KEYS_KV"
 id = "bdd4828ebb1341b293fad17f11af03d1"
 
-# RATE_LIMIT_KV 临时注释，避免部署过程中出现 namespace not found 错误
-# [[kv_namespaces]]
-# binding = "RATE_LIMIT_KV"
-# id = "98c41655cfed4f669e695026a6ed4f78"
-
 [[kv_namespaces]]
 binding = "METRICS_KV"
 id = "3b9f204e59fd4cd1933b2ee1f4d00d6e"
 
-[env.production]
-account_id = "<YOUR_CLOUDFLARE_ACCOUNT_ID>"
-workers_dev = false
-
-[env.production.vars]
-API_MASTER_KEY = "${API_MASTER_KEY}"
-ALLOWED_ORIGINS = "${ALLOWED_ORIGINS}"
-API_KEYS = "${API_KEYS}"
+# 环境变量（通过wrangler secret设置）
+[vars]
+STRICT_MASTER = "0"
+SHOW_MASTER_KEY = "1"
+# 其他变量通过 `wrangler secret put` 设置
