@@ -1,79 +1,63 @@
-name: Deploy Worker
+name: Deploy to Cloudflare Workers
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '20'
 
-      - name: Install jq (used to parse lists)
-        run: sudo apt-get update -y && sudo apt-get install -y jq
+      - name: Install Wrangler
+        run: npm install -g wrangler@4.53.0
 
-      - name: Debug - whoami & kv list (use wrangler v4 via npx)
+      - name: Verify Authentication
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: wrangler whoami
+
+      - name: Deploy Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: |
-          echo "== wrangler@4 whoami =="
-          npx --yes wrangler@4 --account-id "${CLOUDFLARE_ACCOUNT_ID}" whoami || true
-          echo "== wrangler@4 kv:namespace list =="
-          npx --yes wrangler@4 --account-id "${CLOUDFLARE_ACCOUNT_ID}" kv:namespace list --json || npx --yes wrangler@4 --account-id "${CLOUDFLARE_ACCOUNT_ID}" kv:namespace list || true
-
-      - name: Validate KV ids (optional, will skip if secrets not provided)
+          echo "开始部署到 Cloudflare Workers..."
+          
+          # 使用 wrangler deploy 命令，不指定环境参数
+          wrangler deploy --minify
+          
+          echo "部署完成！"
+          echo "Worker 地址：https://stockai-2api.<your-username>.workers.dev"
+          
+      # 可选：部署后设置环境变量
+      - name: Set Secrets (Optional)
+        if: success() && env.API_MASTER_KEY != ''
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          STOCK_KV_ID: ${{ secrets.STOCK_KV_ID }}
-          API_KEYS_KV_ID: ${{ secrets.API_KEYS_KV_ID }}
-          RATE_LIMIT_KV_ID: ${{ secrets.RATE_LIMIT_KV_ID }}
-          METRICS_KV_ID: ${{ secrets.METRICS_KV_ID }}
-        run: |
-          set -euo pipefail
-          echo "Checking provided KV ids against account visibility..."
-          ns_json="$(npx --yes wrangler@4 --account-id "${CLOUDFLARE_ACCOUNT_ID}" kv:namespace list --json 2>/dev/null || echo '[]')"
-          echo "$ns_json" | jq -r '.[] | "\(.id) \(.title)"' > namespaces.txt || true
-          cat namespaces.txt || true
-          check() {
-            local name="$1"; local id="$2"
-            if [ -z "$id" ]; then
-              echo "Skipping $name (no secret supplied)"
-              return
-            fi
-            if grep -q "$id" namespaces.txt; then
-              echo "Found $name ($id)"
-            else
-              echo "::error::$name with id $id not found in account (check CLOUDFLARE_API_TOKEN / account)"
-              exit 1
-            fi
-          }
-          check "STOCK_KV" "$STOCK_KV_ID" || true
-          check "API_KEYS_KV" "$API_KEYS_KV_ID" || true
-          check "RATE_LIMIT_KV" "$RATE_LIMIT_KV_ID" || true
-          check "METRICS_KV" "$METRICS_KV_ID" || true
-          echo "KV validation done."
-
-      - name: Deploy with wrangler v4 via npx
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           API_MASTER_KEY: ${{ secrets.API_MASTER_KEY }}
-          ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
-          API_KEYS: ${{ secrets.API_KEYS }}
+          ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS || '*' }}
+          API_KEYS: ${{ secrets.API_KEYS || '' }}
         run: |
-          set -euo pipefail
-          echo "Deploying with npx wrangler@4 (explicitly using v4 to avoid version mismatch)..."
-          # 正确的方式：--account-id 是全局标志，放在 wrangler 命令后
-          npx --yes wrangler@4 --account-id "${CLOUDFLARE_ACCOUNT_ID}" deploy --minify
+          echo "设置环境变量..."
+          if [ -n "$API_MASTER_KEY" ]; then
+            echo "设置 API_MASTER_KEY..."
+            echo "$API_MASTER_KEY" | wrangler secret put API_MASTER_KEY
+          fi
+          
+          if [ -n "$ALLOWED_ORIGINS" ]; then
+            echo "设置 ALLOWED_ORIGINS..."
+            echo "$ALLOWED_ORIGINS" | wrangler secret put ALLOWED_ORIGINS
+          fi
+          
+          if [ -n "$API_KEYS" ]; then
+            echo "设置 API_KEYS..."
+            echo "$API_KEYS" | wrangler secret put API_KEYS
+          fi
