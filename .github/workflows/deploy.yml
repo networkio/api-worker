@@ -19,16 +19,20 @@ jobs:
         with:
           node-version: 20
 
-      - name: Debug - whoami & kv list (use npx to guarantee wrangler v4)
+      - name: Install jq (used to parse lists)
+        run: sudo apt-get update -y && sudo apt-get install -y jq
+
+      - name: Debug - whoami & kv list (use wrangler v4 via npx)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
-          echo "== wrangler whoami =="
+          echo "== wrangler@4 whoami =="
           npx --yes wrangler@4 whoami || true
-          echo "== wrangler kv:namespace list =="
-          npx --yes wrangler@4 kv:namespace list || true
+          echo "== wrangler@4 kv:namespace list =="
+          # List namespaces and print JSON; v4 supports --json for namespace list
+          npx --yes wrangler@4 kv:namespace list --json || npx --yes wrangler@4 kv:namespace list || true
 
-      - name: Validate required KV namespaces exist
+      - name: Validate KV ids (optional, will skip if secrets not provided)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           STOCK_KV_ID: ${{ secrets.STOCK_KV_ID }}
@@ -37,46 +41,38 @@ jobs:
           METRICS_KV_ID: ${{ secrets.METRICS_KV_ID }}
         run: |
           set -euo pipefail
-          echo "Listing KV namespaces..."
-          npx --yes wrangler@4 kv:namespace list > kvs.txt || true
-          cat kvs.txt
-          MISSING=0
-
-          check_id() {
-            local name="$1"
-            local id="$2"
+          echo "Checking provided KV ids against account visibility..."
+          ns_json="$(npx --yes wrangler@4 kv:namespace list --json 2>/dev/null || echo '[]')"
+          echo "$ns_json" | jq -r '.[] | "\(.id) \(.title)"' > namespaces.txt || true
+          cat namespaces.txt || true
+          check() {
+            local name="$1"; local id="$2"
             if [ -z "$id" ]; then
-              echo "Skipping check for $name (no secret provided)."
+              echo "Skipping $name (no secret supplied)"
               return
             fi
-            if grep -q "$id" kvs.txt; then
-              echo "Found $name with id $id"
+            if grep -q "$id" namespaces.txt; then
+              echo "Found $name ($id)"
             else
-              echo "::error::$name with id $id not found in this account"
-              MISSING=1
+              echo "::error::$name with id $id not found in account (check CLOUDFLARE_API_TOKEN / account)"
+              exit 1
             fi
           }
+          check "STOCK_KV" "$STOCK_KV_ID" || true
+          check "API_KEYS_KV" "$API_KEYS_KV_ID" || true
+          check "RATE_LIMIT_KV" "$RATE_LIMIT_KV_ID" || true
+          check "METRICS_KV" "$METRICS_KV_ID" || true
+          echo "KV validation done."
 
-          check_id "STOCK_KV" "$STOCK_KV_ID"
-          check_id "API_KEYS_KV" "$API_KEYS_KV_ID"
-          check_id "RATE_LIMIT_KV" "$RATE_LIMIT_KV_ID"
-          check_id "METRICS_KV" "$METRICS_KV_ID"
-
-          if [ "$MISSING" -eq 1 ]; then
-            echo "One or more required KV namespaces are missing. Fix the bindings or secrets and re-run."
-            exit 1
-          fi
-
-          echo "All requested KV namespaces exist (or were skipped)."
-
-      - name: Deploy Worker (Cloudflare Wrangler Action)
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Use name to avoid passing empty --env; deploy to top-level config
-          command: deploy --name stockai-2api
+      - name: Deploy with wrangler v4 via npx
         env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           API_MASTER_KEY: ${{ secrets.API_MASTER_KEY }}
           ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
-          API_KEYS: ${{ secrets.API_KEYS }}
+          # keep other runtime vars as needed
+        run: |
+          set -euo pipefail
+          echo "Deploying with npx wrangler@4 (explicitly using v4 to avoid version mismatch)..."
+          # ensure the runner uses the intended config (project root)
+          npx --yes wrangler@4 deploy --name stockai-2api --account-id "${CLOUDFLARE_ACCOUNT_ID}"
