@@ -29,6 +29,7 @@ account_id = "<YOUR_CLOUDFLARE_ACCOUNT_ID>"
 workers_dev = false
 
 [env.production.vars]
+# 在 CI/CD 中通过环境变量注入这些值（不要把真实密钥提交到仓库）
 API_MASTER_KEY = "${API_MASTER_KEY}"
 ALLOWED_ORIGINS = "${ALLOWED_ORIGINS}"
 API_KEYS = "${API_KEYS}"
