@@ -1,17 +1,92 @@
-name: Deploy to Cloudflare Workers
+name: Deploy Worker
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Deploy to Cloudflare Workers (Production)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: (Optional) Install Wrangler CLI for diagnostics
+        run: npm install -g wrangler@4
+
+      - name: Debug - whoami & kv list (will help diagnose binding/account issues)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          wrangler whoami || true
+          wrangler kv:namespace list || true
+
+      - name: Validate required KV namespaces exist
+        # This step uses wrangler to list KV namespaces (as JSON) and verifies
+        # that any configured secret IDs are present in the current account.
+        # Set the following repository secrets if you want them checked:
+        #   STOCK_KV_ID, API_KEYS_KV_ID, RATE_LIMIT_KV_ID, METRICS_KV_ID
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          STOCK_KV_ID: ${{ secrets.STOCK_KV_ID }}
+          API_KEYS_KV_ID: ${{ secrets.API_KEYS_KV_ID }}
+          RATE_LIMIT_KV_ID: ${{ secrets.RATE_LIMIT_KV_ID }}
+          METRICS_KV_ID: ${{ secrets.METRICS_KV_ID }}
+        run: |
+          set -euo pipefail
+          echo "Installing jq for JSON parsing..."
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+          echo "Listing KV namespaces (JSON)..."
+          wrangler kv:namespace list --json > kvs.json || true
+          cat kvs.json
+
+          MISSING=0
+
+          check_id() {
+            local name="$1"
+            local id="$2"
+            if [ -z "$id" ]; then
+              echo "Skipping check for $name (no secret provided)."
+              return
+            fi
+            if jq -e --arg id "$id" '.[] | select(.id == $id)' kvs.json >/dev/null 2>&1; then
+              echo "Found $name with id $id"
+            else
+              echo "::error::$name with id $id not found in this account"
+              MISSING=1
+            fi
+          }
+
+          check_id "STOCK_KV" "$STOCK_KV_ID"
+          check_id "API_KEYS_KV" "$API_KEYS_KV_ID"
+          check_id "RATE_LIMIT_KV" "$RATE_LIMIT_KV_ID"
+          check_id "METRICS_KV" "$METRICS_KV_ID"
+
+          if [ "$MISSING" -eq 1 ]; then
+            echo "One or more required KV namespaces are missing. Fix the bindings or secrets and re-run."
+            exit 1
+          fi
+
+          echo "All requested KV namespaces exist (or were skipped)."
+
+      - name: Deploy Worker (Cloudflare Wrangler Action)
         uses: cloudflare/wrangler-action@v3
         with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          environment: 'production'  # 明确指定环境名称
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --env ""
+        env:
+          # Runtime variables provided to the worker at deploy time (do NOT commit real secrets)
+          API_MASTER_KEY: ${{ secrets.API_MASTER_KEY }}
+          ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
+          API_KEYS: ${{ secrets.API_KEYS }}
