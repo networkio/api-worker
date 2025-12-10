@@ -1,14 +1,4 @@
-name = "stockai-2api"
-main = "worker.js"
-compatibility_date = "2025-12-10"
-type = "javascript"
 
-# 开发时可启用 workers_dev
-workers_dev = true
-
-# 本地开发端口配置（wrangler dev 会覆盖）
-[dev]
-port = 8787
 
 # 绑定 KV 命名空间 —— 在创建完 KV 后把 namespace_id 填入下列字段
 [[kv_namespaces]]
